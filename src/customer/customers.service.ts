@@ -12,7 +12,10 @@ export class CustomersService {
   ) {}
 
   async create(dto: CreateCustomerDTO) {
-    const customer = this.customersRepository.create(dto);
+    const customer = this.customersRepository.create({
+      ...dto,
+      is_deleted: false,
+    });
 
     return await this.customersRepository.save(customer);
   }
