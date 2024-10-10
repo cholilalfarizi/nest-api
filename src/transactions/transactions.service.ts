@@ -28,41 +28,70 @@ export class TransactionService {
     let total_price = 0;
     let total_item = 0;
 
-    // Hitung total harga
-    for (const detail of food_items) {
-      const food = await this.foodRepository.findOne({
-        where: { food_id: detail.food_id },
+    // Mulai transaksi untuk memastikan atomicity
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.startTransaction();
+
+    try {
+      // Hitung total harga dan lakukan pengecekan stok
+      for (const detail of food_items) {
+        const food = await this.foodRepository.findOne({
+          where: { food_id: detail.food_id },
+        });
+        if (!food) throw new NotFoundException('Food not found');
+
+        // Cek apakah stok cukup
+        if (food.stock < detail.qty) {
+          throw new Error(`Not enough stock for ${food.name}`);
+        }
+
+        total_price += food.price * detail.qty;
+        total_item += detail.qty;
+      }
+
+      // Buat transaksi utama
+      const transaction = this.transactionRepository.create({
+        customer: { customer_id },
+        total_price,
+        total_item,
+        transaction_date: new Date(),
+        is_deleted: false,
       });
-      if (!food) throw new Error('Food not found');
-      total_price += food.price * detail.qty;
-      total_item += detail.qty;
+
+      await this.transactionRepository.save(transaction);
+
+      // Simpan detail transaksi dan kurangi stok
+      for (const detail of food_items) {
+        const food = await this.foodRepository.findOne({
+          where: { food_id: detail.food_id },
+        });
+
+        // Kurangi stok makanan
+        food.stock -= detail.qty;
+        await this.foodRepository.save(food); // Simpan perubahan stok
+
+        // Buat detail transaksi
+        const transactionDetail = this.transactionDetailRepository.create({
+          transaction,
+          food,
+          qty: detail.qty,
+          total_price: food.price * detail.qty,
+        });
+        await this.transactionDetailRepository.save(transactionDetail);
+      }
+
+      // Commit transaksi jika semuanya berhasil
+      await queryRunner.commitTransaction();
+
+      return transaction;
+    } catch (error) {
+      // Rollback transaksi jika ada error
+      await queryRunner.rollbackTransaction();
+      throw new InternalServerErrorException(error.message);
+    } finally {
+      // Selesaikan query runner
+      await queryRunner.release();
     }
-
-    const transaction = this.transactionRepository.create({
-      customer: { customer_id },
-      total_price,
-      total_item,
-      transaction_date: new Date(),
-      is_deleted: false,
-    });
-
-    await this.transactionRepository.save(transaction);
-
-    // Simpan detail transaksi
-    for (const detail of food_items) {
-      const food = await this.foodRepository.findOne({
-        where: { food_id: detail.food_id },
-      });
-      const transactionDetail = this.transactionDetailRepository.create({
-        transaction,
-        food,
-        qty: detail.qty,
-        total_price: food.price * detail.qty,
-      });
-      await this.transactionDetailRepository.save(transactionDetail);
-    }
-
-    return transaction;
   }
 
   async updateTransaction(
@@ -140,16 +169,51 @@ export class TransactionService {
     }
   }
 
-  findAll() {
-    return this.transactionRepository.find({ where: { is_deleted: false } });
-  }
-
-  findById(id: number) {
-    const transaction = this.transactionRepository.findOneBy({
-      transaction_id: id,
+  async findAll() {
+    const transactions = await this.transactionRepository.find({
+      where: { is_deleted: false },
+      relations: ['customer'], // Ambil relasi customer
     });
 
-    return transaction;
+    return transactions.map((transaction) => ({
+      transaction_id: transaction.transaction_id,
+      total_price: transaction.total_price,
+      total_item: transaction.total_item,
+      transaction_date: transaction.transaction_date,
+      customer_id: transaction.customer.customer_id,
+    }));
+  }
+
+  async findById(id: number) {
+    const transaction = await this.transactionRepository.findOne({
+      where: { transaction_id: id, is_deleted: false },
+      relations: [
+        'customer',
+        'transaction_details',
+        'transaction_details.food',
+      ], // Ambil relasi terkait
+    });
+
+    if (!transaction) {
+      throw new NotFoundException(`Transaction with ID ${id} not found`);
+    }
+
+    return {
+      total_price: transaction.total_price,
+      transaction_date: transaction.transaction_date,
+      customer: {
+        name: transaction.customer.name,
+      },
+      transaction_details: transaction.transaction_details.map((detail) => ({
+        qty: detail.qty,
+        total_price: detail.total_price,
+        food: {
+          food_id: detail.food.food_id,
+          name: detail.food.name,
+          price: detail.food.price,
+        },
+      })),
+    };
   }
 
   delete(id: number) {
